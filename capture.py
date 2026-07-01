@@ -21,13 +21,19 @@ def _pcap_filename(essid, bssid, output_dir):
     return os.path.join(output_dir, name)
 
 
-def check_handshake(pcap_path):
-    """Return True if pcap contains EAPOL frames (WPA handshake indicator)."""
+def check_handshake(pcap_path, min_eapol=2):
+    """
+    Return True if the pcap looks like it contains a WPA handshake.
+
+    A full 4-way handshake is 4 EAPOL frames; requiring at least min_eapol
+    (default 2) avoids declaring success on a single stray EAPOL frame.
+    """
     # scapy is imported here to avoid slow startup when not needed
     try:
         from scapy.all import rdpcap, EAPOL  # type: ignore
         packets = rdpcap(pcap_path)
-        return any(pkt.haslayer(EAPOL) for pkt in packets)
+        eapol_count = sum(1 for pkt in packets if pkt.haslayer(EAPOL))
+        return eapol_count >= min_eapol
     except Exception:
         return False
 
