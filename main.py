@@ -12,7 +12,6 @@ from rich import box
 
 import utils
 import scanner
-import deauth as deauth_mod
 import capture as capture_mod
 
 
@@ -146,19 +145,12 @@ def do_capture(state):
 
         rprint(f"\n[cyan][*] Processing target: {essid} ({bssid}) ch {channel}[/cyan]")
 
-        # Start deauth in background thread
-        deauth_thread, stop_event = deauth_mod.start_deauth_thread(
-            state["monitor_iface"], bssid, channel
+        # Capture drives its own deauth (broadcast + targeted per client) and
+        # detects full/half handshakes and PMKIDs.
+        success, pcap_path = capture_mod.start_capture(
+            state["monitor_iface"], bssid, channel, essid,
+            output_dir=OUTPUT_DIR
         )
-
-        try:
-            success, pcap_path = capture_mod.start_capture(
-                state["monitor_iface"], bssid, channel, essid,
-                output_dir=OUTPUT_DIR
-            )
-        finally:
-            stop_event.set()
-            deauth_thread.join(timeout=10)
 
         if success:
             state["captured"].append(pcap_path)
