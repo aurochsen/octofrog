@@ -15,47 +15,50 @@ def enable_monitor_mode(iface):
     """Start monitor mode on iface, return monitor interface name."""
     rprint(f"[cyan][*] Enabling monitor mode on {iface}...[/cyan]")
 
-    # Check if monitor interface already exists
+    # Check if a monitor interface for this specific iface already exists
     existing = _find_monitor_iface(iface)
     if existing:
         rprint(f"[yellow][*] Monitor interface {existing} already exists, reusing.[/yellow]")
         return existing
 
-    result = subprocess.run(
+    subprocess.run(
         ["airmon-ng", "start", iface],
         capture_output=True, text=True, timeout=20
     )
 
-    # Parse monitor interface name from output
-    for line in result.stdout.splitlines():
-        m = re.search(r"monitor mode (?:vif )?enabled (?:for|on) \[?\w+\]?\)?.*?(\w+mon\w*)", line, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        m = re.search(r"([\w]+mon[\w]*)", line)
-        if m:
-            return m.group(1)
+    # Authoritative: ask the kernel what monitor interfaces exist for this iface
+    monitor_iface = _find_monitor_iface(iface)
+    if monitor_iface:
+        return monitor_iface
 
-    # Fall back to common naming conventions
-    candidates = [f"{iface}mon", "wlan0mon", "wlan1mon"]
-    for c in candidates:
-        check = subprocess.run(["ip", "link", "show", c], capture_output=True)
-        if check.returncode == 0:
-            return c
-
-    rprint(f"[yellow][*] Could not detect monitor interface name, assuming {iface}mon[/yellow]")
-    return f"{iface}mon"
+    # Last resort: assume standard naming
+    assumed = f"{iface}mon"
+    rprint(f"[yellow][*] Could not detect monitor interface name, assuming {assumed}[/yellow]")
+    return assumed
 
 
 def _find_monitor_iface(base_iface):
-    """Look for an existing monitor-mode interface derived from base_iface."""
+    """Return an existing monitor-mode interface created from base_iface, or None."""
     try:
         result = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=5)
-        ifaces = re.findall(r"Interface (\S+)", result.stdout)
-        for iface in ifaces:
-            if "mon" in iface and base_iface.rstrip("0123456789") in iface:
-                return iface
     except Exception:
-        pass
+        return None
+
+    # Parse blocks: each PHY block lists Interface + type lines
+    # We want interfaces in monitor type whose name starts with base_iface
+    current_iface = None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        m = re.match(r"Interface (\S+)", line)
+        if m:
+            current_iface = m.group(1)
+            continue
+        if current_iface and re.match(r"type monitor", line, re.IGNORECASE):
+            # Only match if this monitor interface belongs to the selected iface.
+            # airmon-ng names the monitor iface after the base (wlan1 -> wlan1mon).
+            if current_iface.startswith(base_iface):
+                return current_iface
+
     return None
 
 
