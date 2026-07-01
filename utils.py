@@ -69,6 +69,50 @@ def restore_managed_mode(monitor_iface):
         rprint(f"[yellow][-] Could not restore managed mode: {e}[/yellow]")
 
 
+def kill_interfering_processes():
+    """
+    Stop NetworkManager/wpa_supplicant so they don't fight airodump-ng for the
+    interface. Returns a list of systemd services that were actually stopped,
+    so they can be restarted on exit.
+    """
+    candidates = ["NetworkManager", "wpa_supplicant"]
+    stopped = []
+    for svc in candidates:
+        try:
+            active = subprocess.run(
+                ["systemctl", "is-active", "--quiet", svc], timeout=5
+            )
+            if active.returncode == 0:
+                subprocess.run(["systemctl", "stop", svc], capture_output=True, timeout=10)
+                stopped.append(svc)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # airmon-ng check kill also handles processes not managed by systemd
+    try:
+        subprocess.run(["airmon-ng", "check", "kill"], capture_output=True, timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    if stopped:
+        rprint(f"[yellow][*] Stopped interfering services: {', '.join(stopped)}[/yellow]")
+    else:
+        rprint("[cyan][*] Killed interfering processes (airmon-ng check kill)[/cyan]")
+    return stopped
+
+
+def restore_network_services(services):
+    """Restart services previously stopped by kill_interfering_processes()."""
+    if not services:
+        return
+    for svc in services:
+        try:
+            subprocess.run(["systemctl", "start", svc], capture_output=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            rprint(f"[yellow][-] Could not restart {svc}[/yellow]")
+    rprint(f"[green][+] Restarted network services: {', '.join(services)}[/green]")
+
+
 def list_pcaps(output_dir="pcaps/"):
     path = Path(output_dir)
     if not path.exists():
