@@ -95,16 +95,27 @@ def do_scan(state):
             rprint(f"[red][-] Failed to enable monitor mode: {e}[/red]")
             return
 
+        if not state["monitor_iface"]:
+            # enable_monitor_mode already printed the reason.
+            return
+
     try:
         duration = 15
         raw = input("Scan duration in seconds [15]: ").strip()
         if raw.isdigit():
             duration = int(raw)
+
+        band = "abg"
+        raw_band = input(
+            "Band(s) to scan - bg=2.4GHz, a=5GHz, abg=both [abg]: "
+        ).strip().lower()
+        if raw_band in ("bg", "a", "abg"):
+            band = raw_band
     except KeyboardInterrupt:
         return
 
     try:
-        aps = scanner.scan_aps(state["monitor_iface"], duration=duration)
+        aps = scanner.scan_aps(state["monitor_iface"], duration=duration, band=band)
         state["last_scan"] = aps
         scanner.display_ap_table(aps)
     except Exception as e:
