@@ -62,18 +62,62 @@ def _find_monitor_iface(base_iface):
     return None
 
 
+def _iface_exists(iface):
+    """Return True if the given network interface currently exists."""
+    try:
+        result = subprocess.run(
+            ["iw", "dev"], capture_output=True, text=True, timeout=5
+        )
+        return iface in re.findall(r"Interface (\S+)", result.stdout)
+    except Exception:
+        return False
+
+
 def scan_aps(monitor_iface, duration=15):
     """Run airodump-ng for duration seconds, parse CSV, return list of AP dicts."""
     rprint(f"[cyan][*] Scanning for APs on {monitor_iface}... ({duration}s)[/cyan]")
+
+    if not _iface_exists(monitor_iface):
+        rprint(
+            f"[red][-] Interface '{monitor_iface}' does not exist. "
+            f"Monitor mode may have failed to start.[/red]"
+        )
+        rprint("[yellow][*] Current interfaces:[/yellow]")
+        try:
+            out = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=5).stdout
+            for m in re.findall(r"Interface (\S+)", out):
+                rprint(f"    - {m}")
+        except Exception:
+            pass
+        return []
 
     with tempfile.TemporaryDirectory(prefix="wifiaudit_scan_") as tmpdir:
         prefix = os.path.join(tmpdir, "scan")
         proc = subprocess.Popen(
             ["airodump-ng", "--write", prefix, "--output-format", "csv", monitor_iface],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
-        time.sleep(duration)
+
+        # Watch for early exit: airodump-ng normally runs until terminated.
+        waited = 0.0
+        interval = 0.5
+        while waited < duration:
+            if proc.poll() is not None:
+                # Process died on its own — capture and report why.
+                output = proc.stdout.read() if proc.stdout else ""
+                rprint(
+                    f"[red][-] airodump-ng exited early (code {proc.returncode}).[/red]"
+                )
+                if output.strip():
+                    for line in output.strip().splitlines()[-8:]:
+                        rprint(f"[yellow]    {line.strip()}[/yellow]")
+                _print_interference_hint()
+                return []
+            time.sleep(interval)
+            waited += interval
+
         proc.terminate()
         try:
             proc.wait(timeout=5)
@@ -82,10 +126,26 @@ def scan_aps(monitor_iface, duration=15):
 
         csv_file = prefix + "-01.csv"
         if not os.path.exists(csv_file):
-            rprint("[yellow][-] No scan output found.[/yellow]")
+            # Check whether other files were written at all.
+            written = os.listdir(tmpdir)
+            rprint("[red][-] No scan output file was produced by airodump-ng.[/red]")
+            if written:
+                rprint(f"[yellow][*] Files in scan dir: {', '.join(written)}[/yellow]")
+            output = proc.stdout.read() if proc.stdout else ""
+            if output.strip():
+                for line in output.strip().splitlines()[-8:]:
+                    rprint(f"[yellow]    {line.strip()}[/yellow]")
+            _print_interference_hint()
             return []
 
         return _parse_airodump_csv(csv_file)
+
+
+def _print_interference_hint():
+    rprint(
+        "[yellow][*] Hint: another process (NetworkManager/wpa_supplicant) may be "
+        "interfering. Try 'airmon-ng check kill' before scanning.[/yellow]"
+    )
 
 
 def _parse_airodump_csv(csv_path):
@@ -148,8 +208,8 @@ def _parse_airodump_csv(csv_path):
             "clients": client_map.get(bssid, 0),
         })
 
-    # Sort by signal strength descending
-    aps.sort(key=lambda x: x["signal"])
+    # Strongest signal first (dBm closest to 0); unknown (0) sorts to the end.
+    aps.sort(key=lambda x: (x["signal"] == 0, -x["signal"]))
     return aps
 
 
