@@ -1,6 +1,7 @@
 import csv
+import shutil
+import signal
 import subprocess
-import tempfile
 import time
 import os
 import re
@@ -12,29 +13,121 @@ from rich import box
 
 
 def enable_monitor_mode(iface):
-    """Start monitor mode on iface, return monitor interface name."""
+    """
+    Put iface into monitor mode and return the monitor interface name.
+
+    Tries airmon-ng first, then falls back to the manual iw/ip method. Every
+    path is verified against the kernel's actual interface type before being
+    accepted, so we never return an interface that isn't really in monitor mode.
+    Returns None if monitor mode could not be established.
+    """
     rprint(f"[cyan][*] Enabling monitor mode on {iface}...[/cyan]")
 
-    # Check if a monitor interface for this specific iface already exists
+    # Already in monitor mode for this specific iface?
     existing = _find_monitor_iface(iface)
     if existing:
         rprint(f"[yellow][*] Monitor interface {existing} already exists, reusing.[/yellow]")
         return existing
 
-    subprocess.run(
+    # --- Method 1: airmon-ng ---
+    result = subprocess.run(
         ["airmon-ng", "start", iface],
         capture_output=True, text=True, timeout=20
     )
+    mon = _find_monitor_iface(iface)
+    if mon and _iface_mode(mon) == "monitor":
+        rprint(f"[green][+] Monitor mode enabled via airmon-ng: {mon}[/green]")
+        return mon
 
-    # Authoritative: ask the kernel what monitor interfaces exist for this iface
-    monitor_iface = _find_monitor_iface(iface)
-    if monitor_iface:
-        return monitor_iface
+    rprint("[yellow][*] airmon-ng did not produce a monitor interface, trying manual method...[/yellow]")
+    if result.stdout.strip():
+        for line in result.stdout.strip().splitlines()[-4:]:
+            rprint(f"[yellow]    {line.strip()}[/yellow]")
 
-    # Last resort: assume standard naming
-    assumed = f"{iface}mon"
-    rprint(f"[yellow][*] Could not detect monitor interface name, assuming {assumed}[/yellow]")
-    return assumed
+    # --- Method 2: manual iw/ip (keeps the same interface name) ---
+    if _manual_monitor(iface):
+        rprint(f"[green][+] Monitor mode enabled via iw: {iface}[/green]")
+        return iface
+
+    # --- Failed ---
+    mode = _iface_mode(iface)
+    rprint(f"[red][-] Failed to enable monitor mode on {iface} (current mode: {mode}).[/red]")
+    _report_monitor_failure(iface)
+    return None
+
+
+def _driver_name(iface):
+    """Return the kernel driver bound to iface (e.g. '88XXau', 'rtl8812au')."""
+    try:
+        link = os.readlink(f"/sys/class/net/{iface}/device/driver")
+        return os.path.basename(link)
+    except OSError:
+        return None
+
+
+def _supports_monitor(iface):
+    """Return True if the adapter's phy advertises monitor mode in 'iw list'."""
+    try:
+        out = subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=8).stdout
+    except Exception:
+        return None
+    # Look inside the "Supported interface modes" block for "monitor".
+    m = re.search(r"Supported interface modes:(.*?)(?:\n\s*\n|\Z)", out, re.DOTALL)
+    if not m:
+        return None
+    return "monitor" in m.group(1).lower()
+
+
+def _report_monitor_failure(iface):
+    driver = _driver_name(iface)
+    supports = _supports_monitor(iface)
+
+    if driver:
+        rprint(f"[yellow][*] Driver bound to {iface}: {driver}[/yellow]")
+
+    # RTL8812AU (ALFA AWUS036ACH) is the classic case: needs the out-of-tree
+    # driver, and if the loaded driver lacks monitor support nothing can set it.
+    is_realtek = driver and re.search(r"88\d\dau|rtl88", driver, re.IGNORECASE)
+
+    if supports is False or (is_realtek and supports is not True):
+        rprint(
+            "[red][-] This adapter's driver does not advertise monitor mode.[/red]"
+        )
+        if is_realtek:
+            rprint(
+                "[yellow][*] RTL8812AU adapters (e.g. ALFA AWUS036ACH) need the "
+                "aircrack-ng RTL8812AU driver. On Kali/Debian:[/yellow]"
+            )
+            rprint("[yellow]    sudo apt update && sudo apt install realtek-rtl88xxau-dkms[/yellow]")
+            rprint("[yellow]    then replug the adapter (or reboot) and retry.[/yellow]")
+        else:
+            rprint(
+                "[yellow][*] Install/replace the adapter's driver with one that "
+                "supports monitor mode, or use a different adapter.[/yellow]")
+    else:
+        rprint(
+            "[yellow][*] A process may still be holding the interface. Ensure "
+            "NetworkManager/wpa_supplicant are stopped and retry. Verify support "
+            "with 'iw list' under 'Supported interface modes'.[/yellow]"
+        )
+
+
+def _manual_monitor(iface):
+    """Switch iface to monitor mode via iw/ip. Returns True on verified success."""
+    cmds = [
+        ["ip", "link", "set", iface, "down"],
+        ["iw", "dev", iface, "set", "type", "monitor"],
+        ["ip", "link", "set", iface, "up"],
+    ]
+    for cmd in cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if r.returncode != 0 and r.stderr.strip():
+                rprint(f"[yellow]    {' '.join(cmd)}: {r.stderr.strip()}[/yellow]")
+        except Exception as e:
+            rprint(f"[yellow]    {' '.join(cmd)} failed: {e}[/yellow]")
+            return False
+    return _iface_mode(iface) == "monitor"
 
 
 def _find_monitor_iface(base_iface):
@@ -93,9 +186,18 @@ def _bring_iface_up(iface):
         pass
 
 
-def scan_aps(monitor_iface, duration=15):
-    """Run airodump-ng for duration seconds, parse CSV, return list of AP dicts."""
-    rprint(f"[cyan][*] Scanning for APs on {monitor_iface}... ({duration}s)[/cyan]")
+def scan_aps(monitor_iface, duration=15, band="abg"):
+    """
+    Run airodump-ng for duration seconds, parse CSV, return list of AP dicts.
+
+    band selects which frequency bands to scan:
+      'bg'  = 2.4 GHz only (airodump-ng default)
+      'a'   = 5 GHz only
+      'abg' = both 2.4 and 5 GHz (default here — dual-band adapters like the
+              AWUS036ACH otherwise miss 5 GHz APs, which airodump does not
+              scan unless told to).
+    """
+    rprint(f"[cyan][*] Scanning for APs on {monitor_iface} (band {band})... ({duration}s)[/cyan]")
 
     if not _iface_exists(monitor_iface):
         rprint(
@@ -121,61 +223,102 @@ def scan_aps(monitor_iface, duration=15):
         return []
     _bring_iface_up(monitor_iface)
 
-    with tempfile.TemporaryDirectory(prefix="wifiaudit_scan_") as tmpdir:
-        prefix = os.path.join(tmpdir, "scan")
-        log_path = os.path.join(tmpdir, "airodump.log")
+    # Use a fixed, persistent directory (not an auto-deleted tempdir) so the
+    # CSV and log survive after the scan and can be inspected / compared with a
+    # manual run.
+    scan_dir = "/tmp/wifiaudit_scan"
+    _reset_scan_dir(scan_dir)
+    prefix = os.path.join(scan_dir, "scan")
+    log_path = os.path.join(scan_dir, "airodump.log")
 
-        # Redirect airodump-ng's live display to a FILE, not an unread pipe:
-        # airodump-ng writes a continuously-updating display to stdout, and an
-        # unread PIPE fills its buffer, blocking the process and stopping capture.
-        with open(log_path, "wb") as logf:
-            proc = subprocess.Popen(
-                ["airodump-ng", "--write", prefix, "--output-format", "csv", monitor_iface],
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-            )
+    cmd = ["airodump-ng", "--write", prefix, "--output-format", "csv"]
+    if band:
+        cmd += ["--band", band]
+    cmd.append(monitor_iface)
 
-            # Watch for early exit: airodump-ng normally runs until terminated.
-            waited = 0.0
-            interval = 0.5
-            exited_early = False
-            while waited < duration:
-                if proc.poll() is not None:
-                    exited_early = True
-                    break
-                time.sleep(interval)
-                waited += interval
+    # Show the exact command so it can be compared against a manual run.
+    rprint(f"[cyan][*] Running: {' '.join(cmd)}[/cyan]")
 
-            if not exited_early:
+    # Let airodump-ng write the CSV itself and just read it. Its live display
+    # (stdout) is discarded; only stderr is kept for diagnostics. Redirect to
+    # files, never an unread PIPE (a full pipe buffer blocks airodump-ng).
+    exited_early = False
+    returncode = None
+    with open(log_path, "wb") as logf:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=logf)
+        waited = 0.0
+        while waited < duration:
+            if proc.poll() is not None:
+                exited_early = True
+                break
+            time.sleep(0.5)
+            waited += 0.5
+        if not exited_early:
+            # Stop airodump-ng the same way a manual Ctrl-C does: SIGINT makes
+            # it flush a complete CSV on exit. SIGTERM (proc.terminate) does
+            # not, and can leave an empty file even though capture worked.
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
                 proc.terminate()
                 try:
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+        returncode = proc.returncode
 
-        log_tail = _read_log_tail(log_path)
+    # Give the filesystem a moment to settle after exit.
+    time.sleep(0.5)
+    log_tail = _read_log_tail(log_path)
 
-        if exited_early:
-            rprint(f"[red][-] airodump-ng exited early (code {proc.returncode}).[/red]")
-            _print_log(log_tail)
-            _print_interference_hint()
-            return []
+    if exited_early:
+        rprint(f"[red][-] airodump-ng exited early (code {returncode}).[/red]")
+        _print_log(log_tail)
+        _print_interference_hint()
+        return []
 
-        csv_file = prefix + "-01.csv"
-        if not os.path.exists(csv_file):
-            written = os.listdir(tmpdir)
-            rprint("[red][-] No scan output file was produced by airodump-ng.[/red]")
-            if written:
-                rprint(f"[yellow][*] Files in scan dir: {', '.join(written)}[/yellow]")
-            _print_log(log_tail)
-            _print_interference_hint()
-            return []
+    csv_file = prefix + "-01.csv"
+    if not os.path.exists(csv_file):
+        written = os.listdir(scan_dir) if os.path.isdir(scan_dir) else []
+        rprint("[red][-] No scan output file was produced by airodump-ng.[/red]")
+        if written:
+            rprint(f"[yellow][*] Files in scan dir: {', '.join(written)}[/yellow]")
+        _print_log(log_tail)
+        _print_interference_hint()
+        return []
 
-        aps = _parse_airodump_csv(csv_file)
-        if not aps:
-            # File exists but held no APs — almost always channel interference.
-            _print_interference_hint()
-        return aps
+    csv_size = os.path.getsize(csv_file)
+    rprint(f"[cyan][*] Parsing {csv_file} ({csv_size} bytes)[/cyan]")
+
+    aps = _parse_airodump_csv(csv_file)
+    if not aps:
+        # Monitor mode is confirmed and airodump ran, but caught no beacons.
+        rprint("[yellow][-] No APs captured. Most likely causes:[/yellow]")
+        rprint(
+            f"[yellow]    - APs are on a band not scanned (this run used "
+            f"band '{band}'). Try band 'abg' to include 5 GHz.[/yellow]"
+        )
+        rprint(
+            "[yellow]    - A connection manager is still changing the "
+            "channel (NetworkManager/wpa_supplicant).[/yellow]"
+        )
+        rprint(
+            "[yellow]    - Scan too short; try a longer duration so every "
+            "channel is visited.[/yellow]"
+        )
+        rprint(f"[yellow][*] Inspect the raw output: cat {csv_file}[/yellow]")
+    return aps
+
+
+def _reset_scan_dir(scan_dir):
+    """Clear any previous scan output so we never read a stale CSV."""
+    try:
+        if os.path.isdir(scan_dir):
+            shutil.rmtree(scan_dir)
+        os.makedirs(scan_dir, exist_ok=True)
+    except Exception:
+        pass
 
 
 def _read_log_tail(log_path, max_lines=10):
