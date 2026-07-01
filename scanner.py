@@ -73,6 +73,26 @@ def _iface_exists(iface):
         return False
 
 
+def _iface_mode(iface):
+    """Return the current type/mode of iface (e.g. 'monitor', 'managed') or None."""
+    try:
+        result = subprocess.run(
+            ["iw", "dev", iface, "info"], capture_output=True, text=True, timeout=5
+        )
+        m = re.search(r"type (\w+)", result.stdout)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _bring_iface_up(iface):
+    """Ensure the interface is administratively UP; airodump-ng needs this."""
+    try:
+        subprocess.run(["ip", "link", "set", iface, "up"], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
 def scan_aps(monitor_iface, duration=15):
     """Run airodump-ng for duration seconds, parse CSV, return list of AP dicts."""
     rprint(f"[cyan][*] Scanning for APs on {monitor_iface}... ({duration}s)[/cyan]")
@@ -91,60 +111,98 @@ def scan_aps(monitor_iface, duration=15):
             pass
         return []
 
+    # airodump-ng silently captures nothing on a down or non-monitor interface.
+    mode = _iface_mode(monitor_iface)
+    if mode and mode != "monitor":
+        rprint(
+            f"[red][-] Interface '{monitor_iface}' is in '{mode}' mode, not monitor. "
+            f"Monitor mode setup failed.[/red]"
+        )
+        return []
+    _bring_iface_up(monitor_iface)
+
     with tempfile.TemporaryDirectory(prefix="wifiaudit_scan_") as tmpdir:
         prefix = os.path.join(tmpdir, "scan")
-        proc = subprocess.Popen(
-            ["airodump-ng", "--write", prefix, "--output-format", "csv", monitor_iface],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
+        log_path = os.path.join(tmpdir, "airodump.log")
 
-        # Watch for early exit: airodump-ng normally runs until terminated.
-        waited = 0.0
-        interval = 0.5
-        while waited < duration:
-            if proc.poll() is not None:
-                # Process died on its own — capture and report why.
-                output = proc.stdout.read() if proc.stdout else ""
-                rprint(
-                    f"[red][-] airodump-ng exited early (code {proc.returncode}).[/red]"
-                )
-                if output.strip():
-                    for line in output.strip().splitlines()[-8:]:
-                        rprint(f"[yellow]    {line.strip()}[/yellow]")
-                _print_interference_hint()
-                return []
-            time.sleep(interval)
-            waited += interval
+        # Redirect airodump-ng's live display to a FILE, not an unread pipe:
+        # airodump-ng writes a continuously-updating display to stdout, and an
+        # unread PIPE fills its buffer, blocking the process and stopping capture.
+        with open(log_path, "wb") as logf:
+            proc = subprocess.Popen(
+                ["airodump-ng", "--write", prefix, "--output-format", "csv", monitor_iface],
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+            )
 
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            # Watch for early exit: airodump-ng normally runs until terminated.
+            waited = 0.0
+            interval = 0.5
+            exited_early = False
+            while waited < duration:
+                if proc.poll() is not None:
+                    exited_early = True
+                    break
+                time.sleep(interval)
+                waited += interval
+
+            if not exited_early:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+        log_tail = _read_log_tail(log_path)
+
+        if exited_early:
+            rprint(f"[red][-] airodump-ng exited early (code {proc.returncode}).[/red]")
+            _print_log(log_tail)
+            _print_interference_hint()
+            return []
 
         csv_file = prefix + "-01.csv"
         if not os.path.exists(csv_file):
-            # Check whether other files were written at all.
             written = os.listdir(tmpdir)
             rprint("[red][-] No scan output file was produced by airodump-ng.[/red]")
             if written:
                 rprint(f"[yellow][*] Files in scan dir: {', '.join(written)}[/yellow]")
-            output = proc.stdout.read() if proc.stdout else ""
-            if output.strip():
-                for line in output.strip().splitlines()[-8:]:
-                    rprint(f"[yellow]    {line.strip()}[/yellow]")
+            _print_log(log_tail)
             _print_interference_hint()
             return []
 
-        return _parse_airodump_csv(csv_file)
+        aps = _parse_airodump_csv(csv_file)
+        if not aps:
+            # File exists but held no APs — almost always channel interference.
+            _print_interference_hint()
+        return aps
+
+
+def _read_log_tail(log_path, max_lines=10):
+    """Read airodump-ng's log, stripping ANSI/curses control sequences."""
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            content = f.read()
+    except Exception:
+        return []
+    # Strip ANSI escape sequences from the live display.
+    content = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", content)
+    content = content.replace("\r", "\n")
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    return lines[-max_lines:]
+
+
+def _print_log(lines):
+    for line in lines:
+        rprint(f"[yellow]    {line}[/yellow]")
 
 
 def _print_interference_hint():
     rprint(
         "[yellow][*] Hint: another process (NetworkManager/wpa_supplicant) may be "
-        "interfering. Try 'airmon-ng check kill' before scanning.[/yellow]"
+        "interfering, or the adapter left monitor mode. The tool runs "
+        "'airmon-ng check kill' automatically; if scans stay empty, verify the "
+        "adapter supports monitor mode with 'iw dev <iface> info'.[/yellow]"
     )
 
 
