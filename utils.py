@@ -8,6 +8,34 @@ from datetime import datetime
 from rich import print as rprint
 
 
+def set_regulatory_domain(country="US"):
+    """
+    Set the wireless regulatory domain.
+
+    A domain of 'country 00' (world/DFS-UNSET) heavily restricts TX power and
+    disables many channels, which stops deauth frames from being transmitted
+    effectively — a common reason handshakes never get captured. Setting a real
+    country code (e.g. US) restores full TX power and channel access.
+    """
+    try:
+        subprocess.run(["iw", "reg", "set", country], capture_output=True, timeout=5)
+        current = subprocess.run(
+            ["iw", "reg", "get"], capture_output=True, text=True, timeout=5
+        ).stdout
+        import re
+        m = re.search(r"country (\S+)", current)
+        shown = m.group(1).rstrip(":") if m else country
+        rprint(f"[green][+] Regulatory domain set to {shown}[/green]")
+        if shown in ("00", "00:"):
+            rprint(
+                "[yellow][*] Domain is still '00' (world). TX power is limited; "
+                "deauth may be weak. Ensure your kernel/CRDA allows the country "
+                "code and the adapter honors it.[/yellow]"
+            )
+    except Exception as e:
+        rprint(f"[yellow][-] Could not set regulatory domain: {e}[/yellow]")
+
+
 def check_root():
     if os.geteuid() != 0:
         rprint("[red][-] This tool must be run as root.[/red]")
