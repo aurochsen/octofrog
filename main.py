@@ -12,6 +12,7 @@ from rich import box
 
 import utils
 import scanner
+import deauth as deauth_mod
 import capture as capture_mod
 
 
@@ -138,6 +139,12 @@ def do_capture(state):
 
     utils.ensure_output_dir(OUTPUT_DIR)
 
+    # Confirm injection works once up front — if it doesn't, deauth can't
+    # capture a handshake and the user should fix that before waiting on timeouts.
+    if not state.get("injection_checked"):
+        deauth_mod.test_injection(state["monitor_iface"])
+        state["injection_checked"] = True
+
     for ap in state["selected"]:
         bssid = ap["bssid"]
         essid = ap["essid"]
@@ -197,6 +204,14 @@ def main():
 
     rprint("[bold cyan]Wireless Audit Tool — authorized use only[/bold cyan]")
 
+    # A real regulatory domain restores full TX power / channels, which deauth
+    # relies on. Default US; let the operator override for their country.
+    try:
+        country = input("Regulatory domain / country code [US]: ").strip().upper()
+    except KeyboardInterrupt:
+        country = ""
+    utils.set_regulatory_domain(country or "US")
+
     iface = prompt_interface()
     state = {
         "iface": iface,
@@ -206,6 +221,7 @@ def main():
         "captured": [],
         "services_killed": False,
         "stopped_services": [],
+        "injection_checked": False,
     }
 
     try:
