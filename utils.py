@@ -59,14 +59,42 @@ def restore_managed_mode(monitor_iface):
     if not monitor_iface:
         return
     rprint(f"[cyan][*] Restoring managed mode for {monitor_iface}...[/cyan]")
+
+    # airmon-ng stop handles the case where a separate *mon interface was
+    # created. For adapters switched in place (e.g. RTL8812AU keeps 'wlan1'),
+    # it may not revert the mode, so fall back to iw and confirm.
     try:
-        subprocess.run(
-            ["airmon-ng", "stop", monitor_iface],
-            capture_output=True, timeout=15
-        )
-        rprint(f"[green][+] Managed mode restored.[/green]")
-    except Exception as e:
-        rprint(f"[yellow][-] Could not restore managed mode: {e}[/yellow]")
+        subprocess.run(["airmon-ng", "stop", monitor_iface], capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+    if _iface_is_monitor(monitor_iface):
+        for cmd in (
+            ["ip", "link", "set", monitor_iface, "down"],
+            ["iw", "dev", monitor_iface, "set", "type", "managed"],
+            ["ip", "link", "set", monitor_iface, "up"],
+        ):
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=10)
+            except Exception:
+                pass
+
+    if _iface_is_monitor(monitor_iface):
+        rprint(f"[yellow][-] {monitor_iface} may still be in monitor mode.[/yellow]")
+    else:
+        rprint("[green][+] Managed mode restored.[/green]")
+
+
+def _iface_is_monitor(iface):
+    """Return True if iface currently exists and is in monitor mode."""
+    try:
+        out = subprocess.run(
+            ["iw", "dev", iface, "info"], capture_output=True, text=True, timeout=5
+        ).stdout
+        import re
+        return re.search(r"type monitor", out) is not None
+    except Exception:
+        return False
 
 
 def kill_interfering_processes():
