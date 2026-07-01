@@ -85,6 +85,11 @@ def do_scan(state):
     if not state["monitor_iface"]:
         try:
             iface = state["iface"]
+            # Stop NetworkManager/wpa_supplicant first so they don't grab the
+            # interface out from under monitor mode / airodump-ng.
+            if not state["services_killed"]:
+                state["stopped_services"] = utils.kill_interfering_processes()
+                state["services_killed"] = True
             state["monitor_iface"] = scanner.enable_monitor_mode(iface)
         except Exception as e:
             rprint(f"[red][-] Failed to enable monitor mode: {e}[/red]")
@@ -196,28 +201,38 @@ def main():
         "last_scan": [],
         "selected": [],
         "captured": [],
+        "services_killed": False,
+        "stopped_services": [],
     }
 
-    while True:
-        try:
-            choice = main_menu(state)
-        except KeyboardInterrupt:
-            choice = "5"
+    try:
+        while True:
+            try:
+                choice = main_menu(state)
+            except KeyboardInterrupt:
+                choice = "5"
 
-        if choice == "1":
-            do_scan(state)
-        elif choice == "2":
-            do_select(state)
-        elif choice == "3":
-            do_capture(state)
-        elif choice == "4":
-            do_list_pcaps()
-        elif choice == "5":
-            utils.restore_managed_mode(state["monitor_iface"])
-            rprint("[cyan][*] Goodbye.[/cyan]")
-            sys.exit(0)
-        else:
-            rprint("[yellow]Invalid choice.[/yellow]")
+            if choice == "1":
+                do_scan(state)
+            elif choice == "2":
+                do_select(state)
+            elif choice == "3":
+                do_capture(state)
+            elif choice == "4":
+                do_list_pcaps()
+            elif choice == "5":
+                rprint("[cyan][*] Goodbye.[/cyan]")
+                break
+            else:
+                rprint("[yellow]Invalid choice.[/yellow]")
+    finally:
+        cleanup(state)
+
+
+def cleanup(state):
+    """Restore the interface and any network services we stopped."""
+    utils.restore_managed_mode(state.get("monitor_iface"))
+    utils.restore_network_services(state.get("stopped_services", []))
 
 
 if __name__ == "__main__":
