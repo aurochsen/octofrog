@@ -25,7 +25,7 @@ def _pcap_filename(essid, bssid, output_dir):
 
 def analyze_capture(pcap_path):
     """
-    Inspect a pcap for crackable WPA material, the way pwnagotchi does.
+    Inspect a pcap for crackable WPA material.
 
     Returns a dict: {eapol: int, pmkid: bool, handshake: bool}.
     Following pwnagotchi, we treat *any* of the following as a usable capture:
@@ -96,7 +96,7 @@ def _clients_for_bssid(csv_path, bssid):
 def start_capture(monitor_iface, bssid, channel, essid, output_dir="pcaps/",
                   timeout=180, deauth_count=8):
     """
-    Capture WPA handshake material for one target, pwnagotchi-style:
+    Capture WPA handshake material for one target:
 
     - lock airodump-ng to the target's channel/BSSID (writes both pcap + CSV)
     - send an association-triggering broadcast deauth, plus targeted deauths to
